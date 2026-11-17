@@ -59,3 +59,10 @@ ul.reasons { margin: .3rem 0 0; padding-left: 1.1rem; color: var(--bad); font-si
 .filters a { color: var(--accent); text-decoration: none; padding: .15rem .5rem; border-radius: 4px; }
 .filters a.active { background: #e6eef8; font-weight: 600; }
 a { color: var(--accent); }
+
+.topnav { display: flex; gap: 1.2rem; margin-bottom: 1rem; font-size: .9rem; }
+.topnav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; }
+.compare-col { border: 1px solid var(--line); border-radius: 8px; padding: .8rem .9rem; }
+.compare-col h3 { margin: 0 0 .6rem; font-size: .95rem; }
+.compare-col table { margin-top: .6rem; }

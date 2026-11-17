@@ -56,6 +56,13 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 | 两实例并发 / 旧扫描不推进新进度 | `mailbox_state` 中的扫描租约（token + 心跳）；`set_progress`、`finish_scan`、标记全部以 token 与 uidvalidity 为条件 |
 | 标记后断连可演示 | 演示源 `POST /ctl/drop-store`：STORE 已生效但连接在回复前被关闭 |
 | 网页：采集 / 重试 / 拒收原因 / 待标记 | `GET /`、`POST /actions/scan`、`POST /actions/retry-marks`、`?mark=pending` 过滤；API 见下 |
+| 单报告冲突裁决：仅限 report_conflict 拒收且仅一个合规 CSV 附件 | 冲突拒收时把已校验的附件以 `candidate_attachments` 保存（不建报告行）；`app/adjudicate.py::eligibility` 逐条核对拒收原因、详情与候选数量 |
+| 对照现行报告与候选原文后确认 | `GET /conflicts/{message_id}` 双栏对照（数据行 + SHA-256 + 版本）；`confirm()` 在同一事务内校验候选文件 SHA-256、页面所见的现行版本号与 SHA-256 |
+| 另一实例先裁决时过期确认必须拒绝 | 页面隐藏字段携带 `expected_current_version` / `expected_current_sha256` / `page_token`；现行版本不匹配即 `StaleDecision`（HTTP 409），不写任何版本 |
+| 旧报告与原始拒收回执可追溯，两版附件均可下载 | `report_version` 保留全部版本，`state='superseded'` 的行不删除；`GET /api/report-versions/{id}/attachment`；原 `message_record` 的拒收原文/回执不变 |
+| 同一裁决重复提交不增加版本 | 页面 `page_token` 相同的重复提交与“候选已是现行”均返回 `idempotent`，只读 |
+| 保存失败不改变当前报告 | 版本翻转、`report` 行与 `adjudication` 审计行在单个 `BEGIN IMMEDIATE` 事务内提交；失败整体回滚 |
+| 后续同号邮件按当前有效版本判定 | 裁决时同步更新 `report` 行；采集端仍只读 `report` 做复用/冲突判定（复用=同 SHA，冲突=不同 SHA） |
 
 ### 关键不变式
 
@@ -77,21 +84,42 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 原件与回执均为内容寻址，重复写入天然幂等；回执包含 UID、UIDVALIDITY、原文
 SHA-256、附件 SHA-256 与全部数据行，可脱离数据库核对。
 
+### 冲突裁决的数据模型
+
+* `report`：每个 `account+mailbox+report_no` 一行，始终指向**当前有效**版本，
+  采集端据此判断后续邮件是复用还是冲突。
+* `report_version`：该报告号的每次被采纳原件各占一行（版本号递增）。同一时刻
+  只有一行 `state='current'`，其余为 `superseded` 且保留附件路径。
+* `adjudication`：每次人工裁决的审计行，唯一键
+  `(account, mailbox, report_no, candidate_sha256)` 保证同一候选最多产生一个
+  版本；`page_token` 区分“同一页面重复提交”和“跨实例过期确认”。
+* 拒收邮件的 `message_record.candidate_attachments` 保存被拦下的合规附件；
+  `message_record.receipt_path` 与被拒原文不变，仍可下载原始拒收回执。
+
 ## 网页 / JSON API
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/` | 仪表盘：统计、邮件记录（收讫/拒收原因/标记状态）、入库报告、扫描历史 |
+| GET | `/` | 仪表盘：统计、待裁决冲突、邮件记录（收讫/拒收原因/标记状态）、入库报告、扫描历史 |
 | GET | `/?mark=pending` | 只看待标记 |
 | POST | `/actions/scan` | 页面“立即采集” |
 | POST | `/actions/retry-marks` | 页面“重试待标记” |
+| GET | `/conflicts` | 单报告冲突裁决列表 + 裁决记录 |
+| GET | `/conflicts/{message_id}` | 现行报告与候选原文对照、确认表单、版本历史 |
+| GET | `/conflicts/{message_id}/candidate` | 下载被拦下的候选 CSV 原件 |
+| POST | `/actions/adjudicate` | 页面“确认候选为当前有效报告” |
 | GET | `/api/status` | 实例、IMAP 探测、统计、邮箱进度、当前租约 |
 | POST | `/api/scan` | 采集；另一实例持有租约时返回 409 |
 | POST | `/api/retry-marks` | 只补标记，不扫描新邮件 |
-| GET | `/api/messages?mark_state=` | 邮件记录（含 `detail_list` 拒收原因、`reports`） |
+| GET | `/api/messages?mark_state=` | 邮件记录（含 `detail_list` 拒收原因、`candidates`、`adjudicable`、`reports`） |
 | GET | `/api/messages/{id}/original` | 下载原始 RFC822 原件 |
-| GET | `/api/messages/{id}/receipt` | 下载固定回执 JSON |
-| GET | `/api/reports/{id}/attachment` | 下载 CSV 原件 |
+| GET | `/api/messages/{id}/receipt` | 下载固定回执 JSON（拒收邮件即原始拒收回执） |
+| GET | `/api/reports/{id}/attachment` | 下载当前有效版本的 CSV 原件 |
+| GET | `/api/conflicts` | 可裁决的单报告冲突列表 |
+| GET | `/api/conflicts/{message_id}` | 对照数据（现行版本、候选、版本历史、`page_token`） |
+| POST | `/api/conflicts/{message_id}/confirm` | 确认候选；过期 409，不符合受理条件 422，重复提交 200 + `idempotent` |
+| GET | `/api/report-versions/{id}/attachment` | 下载任一版本（含已替代）的 CSV 原件 |
+| GET | `/api/adjudications/{id}/receipt` | 下载裁决回执 JSON |
 
 演示源控制 API（`demo-imap:8081`）：`POST /ctl/deliver` 投递、`POST /ctl/rebuild`
 （`{"purge":false}` 重建 UIDVALIDITY 并重排 UID）、`POST /ctl/drop-store`
@@ -106,7 +134,9 @@ python -m pytest -q
 
 覆盖：CSV 校验矩阵、整封拒收、同号同原件复用、同号异文冲突、预先已读、
 标记后断连 + 补标记、UIDVALIDITY 重建与 UID 复用、扫描中途重建、并发租约、
-重启续扫、下载接口与网页动作。
+重启续扫、下载接口与网页动作；以及冲突裁决的受理边界、版本翻转、跨实例过期
+确认、重复提交幂等、保存失败回滚、候选文件缺失、后续邮件按当前版本判定
+（`tests/test_adjudication.py`）。
 
 ## 配置项
 
@@ -129,6 +159,12 @@ python -m pytest -q
 * 生产邮箱的 TLS（`IMAPS`）与 OAuth 未接入；当前用明文 `IMAP4`，演示源亦为明文。
 * 无用户认证/授权；不要把端口直接暴露到不可信网络。
 * 拒收邮件按“已处理”标记 `\Seen`，不移动到隔离文件夹；重投/人工处理需在邮箱侧重发。
+* 冲突裁决只接受“整封只有 1 个附件”的更正邮件；多附件冲突邮件需发件方拆分重发，
+  避免在一次确认里隐式采纳多个报告。
+* 同一候选原件的裁决只记录一次：之后任何邮件的相同候选再确认都是幂等返回，不会
+  再生成版本；恢复旧内容需要以“尚未被裁决过的原件”作为候选（例如新的更正邮件），
+  或由发件方重新生成文件。此限制来自“同一裁决重复提交不增加版本”的幂等键。
+* 无审计用户身份：裁决记录里的 `instance_id` 是服务实例，不是操作者账号。
 * 未实现附件级杀毒、压缩包展开、非 UTF-8 转码、超过 3 件邮件的拆分。
 * SQLite 适合两实例共享卷；更大规模应换 PostgreSQL 与对象存储（租约与幂等键设计可直接迁移）。
 * 演示 IMAP 源仅实现采集所需子集（无 TLS、无 ACL、无 IDLE）；不可用于生产。

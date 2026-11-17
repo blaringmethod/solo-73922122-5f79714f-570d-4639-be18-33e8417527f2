@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<section class="panel">
+  <h2>待裁决的单报告冲突</h2>
+  <p class="hint">仅列出<strong>因报告号冲突（report_conflict）整封拒收、且只含一个合规 CSV 附件</strong>的邮件。
+  对照现行报告与候选原文，确认后候选成为当前有效报告；旧版本与原始拒收回执保留可追溯。</p>
+  <table>
+    <thead><tr><th>邮件</th><th>时间</th><th>UID / UIDVALIDITY</th><th>主题</th><th>报告号</th><th>候选 SHA-256</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for p in pending %}
+      <tr>
+        <td>{{ p.message.id }}</td>
+        <td class="nowrap">{{ p.message.created_at }}</td>
+        <td>{{ p.message.uid }} / {{ p.message.uidvalidity }}</td>
+        <td>{{ p.message.subject or "—" }}</td>
+        <td><code>{{ p.report_no }}</code></td>
+        <td class="mono">{{ p.candidate.attachment_sha256[:16] }}…</td>
+        <td>{% if p.decided %}<span class="badge ok">已裁决</span>{% else %}<span class="badge warn">待裁决</span>{% endif %}</td>
+        <td class="nowrap"><a href="/conflicts/{{ p.message.id }}">核对并裁决</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">当前没有可裁决的单报告冲突。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>裁决记录</h2>
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>报告号</th><th>候选 SHA-256</th><th>原版本 → 新版本</th><th>实例</th><th>回执</th></tr></thead>
+    <tbody>
+    {% for a in decisions %}
+      <tr>
+        <td>{{ a.id }}</td>
+        <td class="nowrap">{{ a.decided_at }}</td>
+        <td><code>{{ a.report_no }}</code></td>
+        <td class="mono">{{ a.candidate_sha256[:16] }}…</td>
+        <td>{{ a.previous_version }} → {{ a.resulting_version }}</td>
+        <td><code>{{ a.instance_id }}</code></td>
+        <td><a href="/api/adjudications/{{ a.id }}/receipt">裁决回执</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="empty">尚无裁决记录。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

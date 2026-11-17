@@ -371,7 +371,8 @@ class Collector:
         )
         if "conflict" in accepted:
             self._commit_rejection(
-                uidvalidity, uid, raw, raw_sha, parsed, accepted["conflict"], existing=existing
+                uidvalidity, uid, raw, raw_sha, parsed, accepted["conflict"],
+                existing=existing, plans=plans,
             )
             return "rejected"
         result.counts["accepted"] += 1
@@ -388,10 +389,30 @@ class Collector:
         parsed,
         reasons: list[dict[str, Any]],
         existing,
+        plans: list[dict[str, Any]] | None = None,
     ) -> None:
         account = self.settings.account
         mailbox = self.settings.imap_mailbox
         original_sha = self.store.put_original(raw)
+        # When the only problem is a report-number conflict, the attachments
+        # themselves were valid.  Persist them so a human can compare the
+        # candidate against the current report and adjudicate; a plain
+        # rejection never leaves partial rows or unvalidated data behind.
+        candidate_attachments: list[dict[str, Any]] = []
+        if plans and all(reason["code"] == "report_conflict" for reason in reasons):
+            for plan in plans:
+                sha, rel = self.store.put_attachment(
+                    plan["report_no"], plan["filename"], plan["content"]
+                )
+                candidate_attachments.append(
+                    {
+                        "report_no": plan["report_no"],
+                        "attachment_sha256": sha,
+                        "attachment_name": plan["filename"],
+                        "attachment_path": str(rel),
+                        "rows": plan["rows"],
+                    }
+                )
         receipt = {
             "type": "rejection",
             "account": account,
@@ -403,11 +424,14 @@ class Collector:
             "from": parsed.from_addr if parsed else None,
             "date": parsed.date_header if parsed else None,
             "reasons": reasons,
+            "candidate_attachments": candidate_attachments,
             "created_at": utcnow(),
         }
         receipt_sha, receipt_rel = self.store.put_receipt(receipt)
         original_rel = f"msgs/{original_sha}.eml"
         primary = reasons[0]
+        detail = _json(reasons)
+        candidate_json = _json(candidate_attachments) if candidate_attachments else None
         with self.db.connect() as conn:
             with transaction(conn):
                 generation = _current_generation(conn, account, mailbox)
@@ -418,9 +442,10 @@ class Collector:
                             raw_sha256, subject, from_addr, date_header,
                             decision, reason_code, reason, mark_state,
                             receipt_sha256, receipt_path, original_path,
-                            report_nos, detail, scan_instance, created_at, updated_at)
+                            report_nos, detail, candidate_attachments,
+                            scan_instance, created_at, updated_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rejected', ?, ?,
-                                   'pending', ?, ?, ?, '[]', ?, ?, ?, ?)""",
+                                   'pending', ?, ?, ?, '[]', ?, ?, ?, ?, ?)""",
                         (
                             account,
                             mailbox,
@@ -436,7 +461,8 @@ class Collector:
                             receipt_sha,
                             str(receipt_rel),
                             original_rel,
-                            _json(reasons),
+                            detail,
+                            candidate_json,
                             self.settings.instance_id,
                             utcnow(),
                             utcnow(),
@@ -449,7 +475,8 @@ class Collector:
                                date_header=?, decision='rejected', reason_code=?,
                                reason=?, mark_state='pending', receipt_sha256=?,
                                receipt_path=?, original_path=?, report_nos='[]',
-                               detail=?, scan_instance=?, updated_at=?
+                               detail=?, candidate_attachments=?,
+                               scan_instance=?, updated_at=?
                            WHERE id=?""",
                         (
                             generation,
@@ -462,7 +489,8 @@ class Collector:
                             receipt_sha,
                             str(receipt_rel),
                             original_rel,
-                            _json(reasons),
+                            detail,
+                            candidate_json,
                             self.settings.instance_id,
                             utcnow(),
                             existing["id"],
@@ -669,6 +697,38 @@ class Collector:
                             utcnow(),
                         ),
                     )
+                    # Ledger row for this accepted original.  A brand-new
+                    # report number starts as version 1 and current; reusing an
+                    # existing original adds no row because it is not a new
+                    # version of the report.
+                    existing_version = conn.execute(
+                        """SELECT 1 FROM report_version
+                           WHERE account=? AND mailbox=? AND report_no=?""",
+                        (account, mailbox, item["report_no"]),
+                    ).fetchone()
+                    if item["disposition"] == "new" and existing_version is None:
+                        conn.execute(
+                            """INSERT INTO report_version
+                               (account, mailbox, report_no, version, state,
+                                sample_no, item, value, rows_json,
+                                attachment_sha256, attachment_name,
+                                attachment_path, source_message_id, created_at)
+                               VALUES (?, ?, ?, 1, 'current', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                account,
+                                mailbox,
+                                item["report_no"],
+                                item["rows"][0][1],
+                                item["rows"][0][2],
+                                item["rows"][0][3],
+                                _json(item["rows"]),
+                                item["sha256"],
+                                item["name"],
+                                item["path"],
+                                message_id,
+                                utcnow(),
+                            ),
+                        )
                     conn.execute(
                         """INSERT OR REPLACE INTO delivery
                            (message_id, report_no, attachment_sha256,

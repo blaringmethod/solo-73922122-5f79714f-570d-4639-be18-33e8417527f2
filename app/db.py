@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utcnow() -> str:
@@ -127,6 +127,10 @@ class Database:
                     original_path TEXT NOT NULL,
                     report_nos TEXT NOT NULL DEFAULT '[]',
                     detail TEXT,
+                    -- Validated attachments held back by a report-number
+                    -- conflict.  They are not reports yet; a human may adopt
+                    -- one through the adjudication page.
+                    candidate_attachments TEXT,
                     scan_instance TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -163,16 +167,70 @@ class Database:
                     UNIQUE (message_id, report_no)
                 );
 
+                -- Every accepted original for a report number keeps its own
+                -- immutable version row.  Exactly one row per report number is
+                -- 'current'; the others are superseded by a human
+                -- adjudication and remain downloadable.
+                CREATE TABLE IF NOT EXISTS report_version (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    report_no TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('current', 'superseded')),
+                    sample_no TEXT NOT NULL,
+                    item TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    rows_json TEXT NOT NULL,
+                    attachment_sha256 TEXT NOT NULL,
+                    attachment_name TEXT NOT NULL,
+                    attachment_path TEXT NOT NULL,
+                    source_message_id INTEGER NOT NULL REFERENCES message_record(id),
+                    created_at TEXT NOT NULL,
+                    superseded_at TEXT,
+                    UNIQUE (account, mailbox, report_no, version)
+                );
+
+                -- Audit trail of human conflict decisions.  The unique key is
+                -- the idempotency guard: the same candidate can be confirmed
+                -- any number of times but creates at most one new version.
+                CREATE TABLE IF NOT EXISTS adjudication (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    report_no TEXT NOT NULL,
+                    message_id INTEGER NOT NULL REFERENCES message_record(id),
+                    candidate_sha256 TEXT NOT NULL,
+                    previous_sha256 TEXT NOT NULL,
+                    previous_version INTEGER NOT NULL,
+                    resulting_version INTEGER NOT NULL,
+                    expected_sha256 TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    page_token TEXT,
+                    receipt_sha256 TEXT,
+                    receipt_path TEXT,
+                    decided_at TEXT NOT NULL,
+                    UNIQUE (account, mailbox, report_no, candidate_sha256)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_message_created
                     ON message_record(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_message_mark
                     ON message_record(account, mailbox, mark_state);
+                CREATE INDEX IF NOT EXISTS idx_message_reason
+                    ON message_record(account, mailbox, decision, reason_code);
                 CREATE INDEX IF NOT EXISTS idx_report_no
                     ON report(account, mailbox, report_no);
                 CREATE INDEX IF NOT EXISTS idx_delivery_message
                     ON delivery(message_id);
                 CREATE INDEX IF NOT EXISTS idx_scan_started
                     ON scan_run(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_report_version_report
+                    ON report_version(account, mailbox, report_no, version DESC);
+                CREATE INDEX IF NOT EXISTS idx_report_version_message
+                    ON report_version(source_message_id);
+                CREATE INDEX IF NOT EXISTS idx_adjudication_time
+                    ON adjudication(decided_at DESC);
                 """
             )
             # Small forward-only migrations for databases created by an
@@ -188,6 +246,37 @@ class Database:
                     "ALTER TABLE mailbox_state"
                     " ADD COLUMN scan_lease_seconds REAL NOT NULL DEFAULT 0"
                 )
+            message_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(message_record)")
+            }
+            if "candidate_attachments" not in message_cols:
+                conn.execute(
+                    "ALTER TABLE message_record ADD COLUMN candidate_attachments TEXT"
+                )
+            adjudication_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(adjudication)")
+            }
+            if "page_token" not in adjudication_cols:
+                conn.execute("ALTER TABLE adjudication ADD COLUMN page_token TEXT")
+            # Seed the version ledger from reports written by earlier builds.
+            # Each pre-existing report becomes version 1 and stays current.
+            # OR IGNORE keeps two instances starting at once from racing here.
+            conn.execute(
+                """INSERT OR IGNORE INTO report_version
+                   (account, mailbox, report_no, version, state, sample_no, item,
+                    value, rows_json, attachment_sha256, attachment_name,
+                    attachment_path, source_message_id, created_at)
+                   SELECT r.account, r.mailbox, r.report_no, 1, 'current',
+                          r.sample_no, r.item, r.value, r.rows_json,
+                          r.attachment_sha256, r.attachment_name,
+                          r.attachment_path, r.source_message_id, r.created_at
+                   FROM report r
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM report_version v
+                       WHERE v.account=r.account AND v.mailbox=r.mailbox
+                         AND v.report_no=r.report_no
+                   )"""
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -501,16 +590,37 @@ class Database:
             return conn.execute(sql, params).fetchall()
 
     def reports_for_message(self, message_id: int) -> list[sqlite3.Row]:
+        """Deliveries of one message, with current-version context.
+
+        ``sample_no``/``item``/``value`` describe the *current* report (what
+        the archive uses today); ``delivered_*`` describe the version that
+        this particular message delivered.  They differ once a later
+        adjudication supersedes this message's original.
+        """
         with self.connect() as conn:
             return conn.execute(
                 """SELECT d.report_no, d.attachment_sha256, d.attachment_name,
                           d.attachment_path, d.disposition, d.created_at,
-                          r.id AS report_id, r.sample_no, r.item, r.value
+                          r.id AS report_id, r.sample_no, r.item, r.value,
+                          r.attachment_sha256 AS current_sha256,
+                          cv.version AS current_version,
+                          v.id AS version_id, v.version AS delivered_version,
+                          v.state AS delivered_state, v.sample_no AS delivered_sample_no,
+                          v.item AS delivered_item, v.value AS delivered_value
                    FROM delivery d
+                   LEFT JOIN message_record m ON m.id=d.message_id
                    LEFT JOIN report r
-                     ON r.account=(SELECT account FROM message_record WHERE id=d.message_id)
-                    AND r.mailbox=(SELECT mailbox FROM message_record WHERE id=d.message_id)
+                     ON r.account=m.account AND r.mailbox=m.mailbox
                     AND r.report_no=d.report_no
+                   LEFT JOIN report_version cv
+                     ON cv.account=m.account AND cv.mailbox=m.mailbox
+                    AND cv.report_no=d.report_no AND cv.state='current'
+                   LEFT JOIN report_version v ON v.id = (
+                       SELECT x.id FROM report_version x
+                       WHERE x.account=m.account AND x.mailbox=m.mailbox
+                         AND x.report_no=d.report_no
+                         AND x.attachment_sha256=d.attachment_sha256
+                       ORDER BY x.version DESC LIMIT 1)
                    WHERE d.message_id=?
                    ORDER BY d.report_no""",
                 (message_id,),
@@ -520,10 +630,98 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM report WHERE id=?", (report_id,)).fetchone()
 
+    def get_report_by_no(
+        self, account: str, mailbox: str, report_no: str
+    ) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT * FROM report
+                   WHERE account=? AND mailbox=? AND report_no=?""",
+                (account, mailbox, report_no),
+            ).fetchone()
+
     def list_reports(self, limit: int = 200) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM report ORDER BY created_at DESC, id DESC LIMIT ?",
+                """SELECT r.*, v.version AS current_version, v.id AS current_version_id
+                   FROM report r
+                   LEFT JOIN report_version v
+                     ON v.account=r.account AND v.mailbox=r.mailbox
+                    AND v.report_no=r.report_no AND v.state='current'
+                   ORDER BY r.created_at DESC, r.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    # ------------------------------------------------------- report versions
+    def report_versions(self, account: str, mailbox: str, report_no: str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT * FROM report_version
+                   WHERE account=? AND mailbox=? AND report_no=?
+                   ORDER BY version DESC""",
+                (account, mailbox, report_no),
+            ).fetchall()
+
+    def report_version(self, version_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM report_version WHERE id=?", (version_id,)
+            ).fetchone()
+
+    def current_version(self, account: str, mailbox: str, report_no: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT * FROM report_version
+                   WHERE account=? AND mailbox=? AND report_no=? AND state='current'
+                   ORDER BY version DESC LIMIT 1""",
+                (account, mailbox, report_no),
+            ).fetchone()
+
+    # ---------------------------------------------------------- adjudication
+    def conflict_messages(
+        self, account: str, mailbox: str, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        """Messages rejected specifically because a report number conflicted."""
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT * FROM message_record
+                   WHERE account=? AND mailbox=? AND decision='rejected'
+                     AND reason_code='report_conflict'
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (account, mailbox, limit),
+            ).fetchall()
+
+    def adjudication_for_candidate(
+        self, account: str, mailbox: str, report_no: str, candidate_sha256: str
+    ) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT * FROM adjudication
+                   WHERE account=? AND mailbox=? AND report_no=?
+                     AND candidate_sha256=?""",
+                (account, mailbox, report_no, candidate_sha256),
+            ).fetchone()
+
+    def adjudications_for_message(self, message_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM adjudication WHERE message_id=? ORDER BY id",
+                (message_id,),
+            ).fetchall()
+
+    def get_adjudication(self, adjudication_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM adjudication WHERE id=?", (adjudication_id,)
+            ).fetchone()
+
+    def list_adjudications(self, limit: int = 50) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT a.*, m.subject, m.uid, m.uidvalidity
+                   FROM adjudication a
+                   LEFT JOIN message_record m ON m.id=a.message_id
+                   ORDER BY a.decided_at DESC, a.id DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
 
@@ -563,6 +761,14 @@ class Database:
                 "stale_marks": one("SELECT COUNT(*) FROM message_record WHERE mark_state='stale'"),
                 "reports": one("SELECT COUNT(*) FROM report"),
                 "scans": one("SELECT COUNT(*) FROM scan_run"),
+                "conflicts": one(
+                    "SELECT COUNT(*) FROM message_record"
+                    " WHERE decision='rejected' AND reason_code='report_conflict'"
+                ),
+                "adjudications": one("SELECT COUNT(*) FROM adjudication"),
+                "superseded_versions": one(
+                    "SELECT COUNT(*) FROM report_version WHERE state='superseded'"
+                ),
             }
 
     def recent_scans(self, limit: int = 20) -> list[sqlite3.Row]:

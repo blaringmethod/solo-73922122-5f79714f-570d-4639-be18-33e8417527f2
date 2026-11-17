@@ -8,9 +8,32 @@
   <div class="card"><span>收讫</span><strong>{{ stats.accepted }}</strong></div>
   <div class="card"><span>拒收</span><strong>{{ stats.rejected }}</strong></div>
   <div class="card"><span>已入库报告</span><strong>{{ stats.reports }}</strong></div>
+  <div class="card"><span>冲突拒收</span><strong>{{ stats.conflicts }}</strong></div>
   <div class="card warn"><span>待标记</span><strong>{{ stats.pending_marks }}</strong></div>
   <div class="card"><span>已标记</span><strong>{{ stats.marked }}</strong></div>
   <div class="card"><span>旧代失效标记</span><strong>{{ stats.stale_marks }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>待裁决的单报告冲突</h2>
+  {% if pending_conflicts %}
+  <table>
+    <thead><tr><th>邮件</th><th>时间</th><th>报告号</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for p in pending_conflicts %}
+      <tr>
+        <td>#{{ p.message.id }} {{ p.message.subject or "—" }}</td>
+        <td class="nowrap">{{ p.message.created_at }}</td>
+        <td><code>{{ p.report_no }}</code></td>
+        <td>{% if p.decided %}<span class="badge ok">已裁决</span>{% else %}<span class="badge warn">待裁决</span>{% endif %}</td>
+        <td><a href="/conflicts/{{ p.message.id }}">核对并裁决</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">当前没有可裁决的单报告冲突。仅受理因 report_conflict 拒收且只含一个合规 CSV 附件的邮件。</p>
+  {% endif %}
 </section>
 
 <section class="panel">
@@ -62,6 +85,7 @@
                 {% for r in m.detail_list %}<li><code>{{ r.code }}</code> {{ r.message }}</li>{% endfor %}
               </ul>
             {% endif %}
+            {% if m.adjudicable %}<div><a href="/conflicts/{{ m.id }}">核对并裁决</a></div>{% endif %}
           {% endif %}
         </td>
         <td>
@@ -72,6 +96,11 @@
         </td>
         <td>
           {% for r in m.report_nos_list %}<code>{{ r }}</code> {% endfor %}
+          {% for d in m.reports %}
+            {% if d.current_sha256 and d.current_sha256 != d.attachment_sha256 %}
+              <div class="reason">{{ d.report_no }} 已被新版本替代（本邮件原件见回执）</div>
+            {% endif %}
+          {% endfor %}
         </td>
         <td class="nowrap">
           <a href="/api/messages/{{ m.id }}/original">原件</a>
@@ -88,19 +117,21 @@
 <section class="panel">
   <h2>入仓报告</h2>
   <table>
-    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>附件</th></tr></thead>
+    <thead><tr><th>报告号</th><th>版本</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>附件</th><th>历史</th></tr></thead>
     <tbody>
     {% for r in reports %}
       <tr>
         <td><code>{{ r.report_no }}</code></td>
+        <td>{% if r.current_version %}第 {{ r.current_version }} 版{% else %}—{% endif %}</td>
         <td>{{ r.sample_no }}</td>
         <td>{{ r.item }}</td>
         <td>{{ r.value }}</td>
         <td class="mono">{{ r.attachment_sha256[:16] }}…</td>
         <td><a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a></td>
+        <td>{% if r.current_version and r.current_version > 1 %}<span class="badge warn">已裁决</span>{% endif %}</td>
       </tr>
     {% else %}
-      <tr><td colspan="6" class="empty">暂无报告。</td></tr>
+      <tr><td colspan="8" class="empty">暂无报告。</td></tr>
     {% endfor %}
     </tbody>
   </table>

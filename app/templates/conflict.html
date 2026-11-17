@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block content %}
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<p class="filters"><a href="/conflicts">← 返回冲突裁决列表</a></p>
+
+<section class="panel">
+  <h2>候选邮件 #{{ view.message.id }}</h2>
+  <dl class="kv">
+    <dt>主题</dt><dd>{{ view.message.subject or "—" }}</dd>
+    <dt>UID / UIDVALIDITY</dt><dd>{{ view.message.uid }} / {{ view.message.uidvalidity }}</dd>
+    <dt>入库时间</dt><dd>{{ view.message.created_at }}</dd>
+    <dt>拒收原因</dt><dd><code>{{ view.message.reason_code }}</code> {{ view.message.reason }}</dd>
+    <dt>原件 SHA-256</dt><dd class="mono">{{ view.message.raw_sha256 }}</dd>
+    <dt>原件 / 回执</dt>
+    <dd>
+      <a href="/api/messages/{{ view.message.id }}/original">下载原始邮件</a>
+      <a href="/api/messages/{{ view.message.id }}/receipt">下载原始拒收回执</a>
+    </dd>
+  </dl>
+</section>
+
+{% if not view.eligible %}
+<section class="panel">
+  <h2>不可裁决</h2>
+  <p class="reason">{{ view.ineligible_reason }}</p>
+  {% if view.candidates %}
+  <table>
+    <thead><tr><th>报告号</th><th>附件</th><th>SHA-256</th></tr></thead>
+    <tbody>
+    {% for c in view.candidates %}
+      <tr><td><code>{{ c.report_no }}</code></td><td>{{ c.attachment_name }}</td><td class="mono">{{ c.attachment_sha256 }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% else %}
+{% set candidate = view.candidate %}
+<section class="panel">
+  <h2>报告 {{ view.report_no }}：现行版本与候选原文</h2>
+  <p class="hint">确认前请核对两边的数据行与附件 SHA-256。确认时以本页所见的现行版本为条件；
+  若另一实例已先完成裁决，本页的确认将因过期而被拒绝，须重新打开核对。</p>
+  <div class="compare">
+    <div class="compare-col">
+      <h3>现行有效报告{% if view.current %}（第 {{ view.current.version }} 版）{% endif %}</h3>
+      {% if view.current %}
+        <dl class="kv">
+          <dt>样本号</dt><dd>{{ view.current.sample_no }}</dd>
+          <dt>项目</dt><dd>{{ view.current.item }}</dd>
+          <dt>测值</dt><dd>{{ view.current.value }}</dd>
+          <dt>附件</dt><dd>{{ view.current.attachment_name }}</dd>
+          <dt>SHA-256</dt><dd class="mono">{{ view.current.attachment_sha256 }}</dd>
+          <dt>来源邮件</dt><dd>#{{ view.current.source_message_id }}</dd>
+          <dt>生效时间</dt><dd>{{ view.current.created_at }}</dd>
+        </dl>
+        <p><a href="/api/report-versions/{{ view.current.id }}/attachment">下载现行附件</a></p>
+        <table>
+          <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th></tr></thead>
+          <tbody>
+          {% for row in view.current.rows_json | fromjson %}
+            <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="reason">未找到当前有效版本。</p>
+      {% endif %}
+    </div>
+    <div class="compare-col">
+      <h3>候选原件（本次拒收邮件）</h3>
+      <dl class="kv">
+        <dt>附件</dt><dd>{{ candidate.attachment_name }}</dd>
+        <dt>SHA-256</dt><dd class="mono">{{ candidate.attachment_sha256 }}</dd>
+        <dt>报告号</dt><dd><code>{{ candidate.report_no }}</code></dd>
+      </dl>
+      <p><a href="/conflicts/{{ view.message.id }}/candidate">下载候选附件</a></p>
+      <table>
+        <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th></tr></thead>
+        <tbody>
+        {% for row in candidate.rows %}
+          <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+{% if view.current and view.current.attachment_sha256 == candidate.attachment_sha256 %}
+<section class="panel">
+  <p>候选附件与现行报告一致，无需裁决。</p>
+</section>
+{% else %}
+<section class="panel">
+  <h2>确认将候选定为当前有效报告</h2>
+  {% if view.current %}
+  <form method="post" action="/actions/adjudicate">
+    <input type="hidden" name="message_id" value="{{ view.message.id }}">
+    <input type="hidden" name="report_no" value="{{ view.report_no }}">
+    <input type="hidden" name="candidate_sha256" value="{{ candidate.attachment_sha256 }}">
+    <input type="hidden" name="expected_current_version" value="{{ view.current.version }}">
+    <input type="hidden" name="expected_current_sha256" value="{{ view.current.attachment_sha256 }}">
+    <input type="hidden" name="page_token" value="{{ view.page_token }}">
+    <p class="hint">本次确认基于现行第 {{ view.current.version }} 版
+      （<span class="mono">{{ view.current.attachment_sha256[:16] }}…</span>）与候选
+      <span class="mono">{{ candidate.attachment_sha256[:16] }}…</span>。</p>
+    <div class="actions">
+      <button type="submit">确认候选为当前有效报告</button>
+    </div>
+  </form>
+  {% else %}
+  <p class="reason">现行报告缺失，无法提交确认。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>版本历史</h2>
+  <table>
+    <thead><tr><th>版本</th><th>状态</th><th>样本号</th><th>项目</th><th>测值</th><th>SHA-256</th><th>来源邮件</th><th>生效 / 被替代</th><th>附件</th></tr></thead>
+    <tbody>
+    {% for v in view.versions %}
+      <tr class="{{ 'row-bad' if v.state == 'superseded' else '' }}">
+        <td>{{ v.version }}</td>
+        <td><span class="badge {{ 'ok' if v.state == 'current' else 'warn' }}">{{ "当前有效" if v.state == "current" else "已被替代" }}</span></td>
+        <td>{{ v.sample_no }}</td><td>{{ v.item }}</td><td>{{ v.value }}</td>
+        <td class="mono">{{ v.attachment_sha256[:16] }}…</td>
+        <td>#{{ v.source_message_id }}</td>
+        <td class="nowrap">{{ v.created_at }}{% if v.superseded_at %}<br>↓ {{ v.superseded_at }}{% endif %}</td>
+        <td><a href="/api/report-versions/{{ v.id }}/attachment">{{ v.attachment_name }}</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="9" class="empty">暂无版本记录。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>该报告号的裁决记录</h2>
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>候选 SHA-256</th><th>原版本 → 新版本</th><th>实例</th><th>回执</th></tr></thead>
+    <tbody>
+    {% for a in view.history %}
+      <tr>
+        <td>{{ a.id }}</td>
+        <td class="nowrap">{{ a.decided_at }}</td>
+        <td class="mono">{{ a.candidate_sha256[:16] }}…</td>
+        <td>{{ a.previous_version }} → {{ a.resulting_version }}</td>
+        <td><code>{{ a.instance_id }}</code></td>
+        <td><a href="/api/adjudications/{{ a.id }}/receipt">裁决回执</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">暂无裁决记录。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}
